@@ -24,13 +24,28 @@ parser.add_argument("--eval_batch_size", default=8, type=int, help="Total batch 
 
 parser.add_argument("--img_size", default=448, type=int, help="Resolution size")
 
+parser.add_argument('--smoothing_value', type=float, default=0.0, help="Label smoothing value\n")
+
 args = parser.parse_args()
 args.data_root = os.path.join(args.data_root, args.dataset)
 train_loader, test_loader = get_loader(args)
 
 
 config = CONFIGS['debug']
-model = VisionTransformer(config, args.img_size)
+
+
+if args.dataset == "CUB_200_2011":
+    num_classes = 200
+elif args.dataset == "car":
+    num_classes = 196
+elif args.dataset == "nabirds":
+    num_classes = 555
+elif args.dataset == "dog":
+    num_classes = 120
+elif args.dataset == "INat2017":
+    num_classes = 5089
+
+model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes, smoothing_value=args.smoothing_value)
 while True:
     model.train()
     epoch_iterator = tqdm(train_loader,
@@ -40,7 +55,7 @@ while True:
     for step, batch in enumerate(epoch_iterator):
             batch = tuple(batch)
             x, y = batch
-            t = model(x, y)
-            print(t.shape)
+            loss, logits = model(x, y)
+            print(loss.shape, logits.shape)
     break
     

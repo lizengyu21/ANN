@@ -175,13 +175,33 @@ class Transformer(nn.Module):
         return part_encoded
 
 class VisionTransformer(nn.Module):
-    def __init__(self, config, img_size=448):
+    def __init__(self, config, img_size=448, num_classes=200, smoothing_value=0, zero_head=False):
         super(VisionTransformer, self).__init__()
         
+        self.num_classes = num_classes
+        self.smoothing_value = smoothing_value
+        self.zero_head = zero_head
+        self.classifier = config.classifier
+        
         self.transformer = Transformer(config, img_size)
+        self.part_head = nn.Linear(config.hidden_size, num_classes)
+        
     def execute(self, x, labels=None):
+        # [TODO] 这里的Loss还需要修改
         part_tokens = self.transformer(x)
-        # [TODO] 抄到这里了
+        part_logits = self.part_head(part_tokens[:, 0])
+        if labels is not None:
+            if self.smoothing_value == 0:
+                print('=========================')
+                loss_fct = nn.CrossEntropyLoss()
+            else:
+                print('Label Smoothing TODO')
+            part_loss = loss_fct(part_logits.view(-1, self.num_classes), labels.view(-1))
+            loss = part_loss
+            return loss, part_logits
+        else:
+            return part_logits
+        # [TODO] 到这里了
         return part_tokens
     
 CONFIGS = {
