@@ -3,7 +3,7 @@ import argparse
 import os
 
 import logging
-
+import time
 from tqdm import tqdm
 import numpy as np
 import jittor as jt
@@ -62,7 +62,7 @@ parser.add_argument("--dataset", choices=["CUB_200_2011", "car", "dog", "nabirds
 
 parser.add_argument('--data_root', type=str, default='./minist')
 
-parser.add_argument("--train_batch_size", default=16, type=int, help="Total batch size for training.")
+parser.add_argument("--train_batch_size", default=8, type=int, help="Total batch size for training.")
 
 parser.add_argument("--eval_batch_size", default=8, type=int, help="Total batch size for eval.")
 
@@ -70,22 +70,34 @@ parser.add_argument("--img_size", default=448, type=int, help="Resolution size")
 
 parser.add_argument('--smoothing_value', type=float, default=0.0, help="Label smoothing value\n")
 
-parser.add_argument("--learning_rate", default=4e-2, type=float, help="The initial learning rate for SGD.")
+parser.add_argument("--learning_rate", default=3e-2, type=float, help="The initial learning rate for SGD.")
 
-parser.add_argument("--num_steps", default=10000, type=int, help="Total number of training epochs to perform.")
+parser.add_argument("--num_steps", default=10001, type=int, help="Total number of training epochs to perform.")
 
-parser.add_argument("--eval_every", default=500, type=int, help="Run prediction on validation set every so many steps."
+parser.add_argument("--eval_every", default=2000, type=int, help="Run prediction on validation set every so many steps."
                              "Will always run one evaluation at the end of training.")
 
 parser.add_argument("--pretrained_dir", type=str, default="./minist/ViT-B_16.npz", help="Where to search for pretrained ViT models.")
+
+parser.add_argument("--output_dir", type=str, default="./output", help="The output directory where the model checkpoints will be written.")
+
+parser.add_argument("--contrastive", type=int, default=1, help="Whether to use contrastive learning. 0 for False, 1 for True.")
+
+parser.add_argument('--split', type=str, default='overlap', help="Split method")
+
+parser.add_argument('--margin', type=float, default=0.4, help="Margin for contrastive loss")
 
 args = parser.parse_args()
 args.data_root = os.path.join(args.data_root, args.dataset)
 train_loader, test_loader = get_loader(args)
 
 
-config = CONFIGS['debug']
+config = CONFIGS['ViT-B_16']
+config.split = args.split
 
+os.makedirs(args.output_dir, exist_ok=True)
+filename = args.split + "_contrastive(" + str(args.contrastive) + ")_margin(" + str(args.margin) + ").txt"
+filepath = os.path.join(args.output_dir, filename)
 
 if args.dataset == "CUB_200_2011":
     num_classes = 200
@@ -98,12 +110,14 @@ elif args.dataset == "dog":
 elif args.dataset == "INat2017":
     num_classes = 5089
 
-model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes, smoothing_value=args.smoothing_value)
+model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes, smoothing_value=args.smoothing_value, constrastive=args.contrastive, margin=args.margin)
 model.load_from(np.load(args.pretrained_dir))
 optimizer = jt.optim.SGD(model.parameters(), lr=args.learning_rate, momentum=0.9)
-scheduler = jt.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=100, verbose=True, cooldown=400)
 t_total = args.num_steps
+scheduler = jt.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_total)
 global_step = 0
+start_time = time.time()
+
 while True:
     model.train()
     epoch_iterator = tqdm(train_loader,
@@ -130,14 +144,21 @@ while True:
                 all_label[0], y.detach().numpy(), axis=0
             )
         optimizer.step(loss)
-        scheduler.step(loss)
+        scheduler.step()
         
         epoch_iterator.set_description(
                     "Training (%d / %d Steps) (loss=%2.5f)" % (global_step, t_total, loss.detach().numpy())
                 )
         
         if global_step % args.eval_every == 0:
+            log_time = time.time()
             accuracy = valid(args, model, test_loader, global_step)
+            valid_time = time.time() - log_time
+            if jt.rank == 0:
+                with open(filepath, "a+") as f:
+                    f.write(f"Train Duration: {log_time - start_time}s Step: {global_step}, Accuracy: {accuracy}\n")
+            
+            start_time += valid_time
         
         if global_step >= t_total:
             break

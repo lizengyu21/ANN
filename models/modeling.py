@@ -27,12 +27,15 @@ class Embeddings(nn.Module):
         super(Embeddings, self).__init__()
         img_size = (img_size, img_size)
         patch_size = config.patches["size"]
+        # print("config.split", config.split)
         if config.split == 'non-overlap':
             n_patches = (img_size[0] // patch_size[0]) * (img_size[1] // patch_size[1])
             stride = patch_size
         elif config.split == 'overlap':
             n_patches = ((img_size[0] - patch_size[0]) // config.slide_step + 1) * ((img_size[1] - patch_size[1]) // config.slide_step + 1)
             stride = (config.slide_step, config.slide_step)
+        else:
+            raise ValueError('Invalid split method: {}'.format(config.split))
         self.patch_embeddings = nn.Conv(in_channels=in_channels, out_channels=config.hidden_size, kernel_size=patch_size, stride=stride)
         self.position_embeddings = jt.zeros((1, n_patches + 1, config.hidden_size))
         self.cls_token = jt.zeros((1, 1, config.hidden_size))
@@ -243,21 +246,10 @@ class Transformer(nn.Module):
         part_encoded = self.encoder(embedding_output)
         return part_encoded
 
-def con_loss(features, labels):
-    B, _ = features.shape
-    features = jt.normalize(features)
-    cos_matrix = jt.matmul(features, features.transpose(0, 1))
-    pos_label_matrix = jt.stack([jt.float32(labels == labels[i]) for i in range(B)])
-    neg_label_matrix = 1 - pos_label_matrix
-    pos_cos_matrix = 1 - cos_matrix
-    neg_cos_matrix = cos_matrix - 0.4
-    neg_cos_matrix[neg_cos_matrix < 0] = 0
-    loss = (pos_cos_matrix * pos_label_matrix).sum() + (neg_cos_matrix * neg_label_matrix).sum()
-    loss /= (B * B)
-    return loss
+
 
 class VisionTransformer(nn.Module):
-    def __init__(self, config, img_size=448, num_classes=200, smoothing_value=0, zero_head=False):
+    def __init__(self, config, img_size=448, num_classes=200, smoothing_value=0, zero_head=False, constrastive=1, margin=0.4):
         super(VisionTransformer, self).__init__()
         
         self.num_classes = num_classes
@@ -267,7 +259,23 @@ class VisionTransformer(nn.Module):
         
         self.transformer = Transformer(config, img_size)
         self.part_head = nn.Linear(config.hidden_size, num_classes)
-        
+        self.constrastive = constrastive
+        self.margin = margin
+
+    def con_loss(self, features, labels):
+        B, _ = features.shape
+        features = jt.normalize(features)
+        cos_matrix = jt.matmul(features, features.transpose(0, 1))
+        pos_label_matrix = jt.stack([jt.float32(labels == labels[i]) for i in range(B)])
+        neg_label_matrix = 1 - pos_label_matrix
+        pos_cos_matrix = 1 - cos_matrix
+        # print("margin", self.margin)
+        neg_cos_matrix = cos_matrix - self.margin
+        neg_cos_matrix[neg_cos_matrix < 0] = 0
+        loss = (pos_cos_matrix * pos_label_matrix).sum() + (neg_cos_matrix * neg_label_matrix).sum()
+        loss /= (B * B)
+        return loss
+
     def execute(self, x, labels=None):
         part_tokens = self.transformer(x)
         part_logits = self.part_head(part_tokens[:, 0])
@@ -277,8 +285,14 @@ class VisionTransformer(nn.Module):
             else:
                 loss_fct = LabelSmoothing(self.smoothing_value)
             part_loss = loss_fct(part_logits.view(-1, self.num_classes), labels.view(-1))
-            contrast_loss = con_loss(part_tokens[:, 0], labels.view(-1))
+            # print("constrastive", self.constrastive)
+            
+            if self.constrastive == 0:
+                return part_loss, part_logits
+            # print("contrast should be 1")
+            contrast_loss = self.con_loss(part_tokens[:, 0], labels.view(-1))
             loss = part_loss + contrast_loss
+            
             return loss, part_logits
         else:
             return part_logits
