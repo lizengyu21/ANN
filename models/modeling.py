@@ -3,6 +3,24 @@ from jittor import nn
 from jittor import init
 import models.configs as configs
 import copy
+import numpy as np
+from scipy import ndimage
+from os.path import join as pjoin
+
+ATTENTION_Q = "MultiHeadDotProductAttention_1/query"
+ATTENTION_K = "MultiHeadDotProductAttention_1/key"
+ATTENTION_V = "MultiHeadDotProductAttention_1/value"
+ATTENTION_OUT = "MultiHeadDotProductAttention_1/out"
+FC_0 = "MlpBlock_3/Dense_0"
+FC_1 = "MlpBlock_3/Dense_1"
+ATTENTION_NORM = "LayerNorm_0"
+MLP_NORM = "LayerNorm_2"
+
+def np2jt(weights, conv=False):
+    """Possibly convert HWIO to OIHW."""
+    if conv:
+        weights = weights.transpose([3, 2, 0, 1])
+    return jt.array(weights)
 
 class Embeddings(nn.Module):
     def __init__(self, config, img_size, in_channels=3):
@@ -31,6 +49,19 @@ class Embeddings(nn.Module):
         embeddings = x + self.position_embeddings
         embeddings = self.dropout(embeddings)
         return embeddings
+
+class LabelSmoothing(nn.Module):
+    def __init__(self, smoothing=0.0):
+        super(LabelSmoothing, self).__init__()
+        self.confidence = 1.0 - smoothing
+        self.smoothing = smoothing
+    def execute(self, x, target):
+        logprobs = nn.log_softmax(x, dim=-1)
+        nll_loss = -jt.misc.gather(logprobs, dim=-1, index=target.unsqueeze(1))
+        nll_loss = nll_loss.squeeze(1)
+        smooth_loss = -logprobs.mean(dim=-1)
+        loss = self.confidence * nll_loss + self.smoothing * smooth_loss
+        return loss.mean()
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -120,6 +151,44 @@ class Block(nn.Module):
         x = x + h
         return x, weights
 
+    def load_from(self, weights, n_block):
+        ROOT = f"Transformer/encoderblock_{n_block}"
+        with jt.no_grad():
+            query_weight = np2jt(weights[pjoin(ROOT, ATTENTION_Q, "kernel")]).view(self.hidden_size, self.hidden_size).transpose(0, 1)
+            key_weight = np2jt(weights[pjoin(ROOT, ATTENTION_K, "kernel")]).view(self.hidden_size, self.hidden_size).transpose(0, 1)
+            value_weight = np2jt(weights[pjoin(ROOT, ATTENTION_V, "kernel")]).view(self.hidden_size, self.hidden_size).transpose(0, 1)
+            out_weight = np2jt(weights[pjoin(ROOT, ATTENTION_OUT, "kernel")]).view(self.hidden_size, self.hidden_size).transpose(0, 1)
+
+            query_bias = np2jt(weights[pjoin(ROOT, ATTENTION_Q, "bias")]).view(-1)
+            key_bias = np2jt(weights[pjoin(ROOT, ATTENTION_K, "bias")]).view(-1)
+            value_bias = np2jt(weights[pjoin(ROOT, ATTENTION_V, "bias")]).view(-1)
+            out_bias = np2jt(weights[pjoin(ROOT, ATTENTION_OUT, "bias")]).view(-1)
+
+            self.attn.query.weight = query_weight
+            self.attn.key.weight = key_weight
+            self.attn.value.weight = value_weight
+            self.attn.out.weight = out_weight
+            self.attn.query.bias = query_bias
+            self.attn.key.bias = key_bias
+            self.attn.value.bias = value_bias
+            self.attn.out.bias = out_bias
+
+            mlp_weight_0 = np2jt(weights[pjoin(ROOT, FC_0, "kernel")]).transpose(0, 1)
+            mlp_weight_1 = np2jt(weights[pjoin(ROOT, FC_1, "kernel")]).transpose(0, 1)
+            mlp_bias_0 = np2jt(weights[pjoin(ROOT, FC_0, "bias")])
+            mlp_bias_1 = np2jt(weights[pjoin(ROOT, FC_1, "bias")])
+
+            self.ffn.fc1.weight = mlp_weight_0
+            self.ffn.fc2.weight = mlp_weight_1
+            self.ffn.fc1.bias = mlp_bias_0
+            self.ffn.fc2.bias = mlp_bias_1
+
+            self.attention_norm.weight = np2jt(weights[pjoin(ROOT, ATTENTION_NORM, "scale")])
+            self.attention_norm.bias = np2jt(weights[pjoin(ROOT, ATTENTION_NORM, "bias")])
+            self.ffn_norm.weight = np2jt(weights[pjoin(ROOT, MLP_NORM, "scale")])
+            self.ffn_norm.bias = np2jt(weights[pjoin(ROOT, MLP_NORM, "bias")])
+            
+            
 class Part_Attention(nn.Module):
     def __init__(self):
         super(Part_Attention, self).__init__()
@@ -174,6 +243,19 @@ class Transformer(nn.Module):
         part_encoded = self.encoder(embedding_output)
         return part_encoded
 
+def con_loss(features, labels):
+    B, _ = features.shape
+    features = jt.normalize(features)
+    cos_matrix = jt.matmul(features, features.transpose(0, 1))
+    pos_label_matrix = jt.stack([jt.float32(labels == labels[i]) for i in range(B)])
+    neg_label_matrix = 1 - pos_label_matrix
+    pos_cos_matrix = 1 - cos_matrix
+    neg_cos_matrix = cos_matrix - 0.4
+    neg_cos_matrix[neg_cos_matrix < 0] = 0
+    loss = (pos_cos_matrix * pos_label_matrix).sum() + (neg_cos_matrix * neg_label_matrix).sum()
+    loss /= (B * B)
+    return loss
+
 class VisionTransformer(nn.Module):
     def __init__(self, config, img_size=448, num_classes=200, smoothing_value=0, zero_head=False):
         super(VisionTransformer, self).__init__()
@@ -187,22 +269,55 @@ class VisionTransformer(nn.Module):
         self.part_head = nn.Linear(config.hidden_size, num_classes)
         
     def execute(self, x, labels=None):
-        # [TODO] 这里的Loss还需要修改
         part_tokens = self.transformer(x)
         part_logits = self.part_head(part_tokens[:, 0])
         if labels is not None:
             if self.smoothing_value == 0:
-                print('=========================')
                 loss_fct = nn.CrossEntropyLoss()
             else:
-                print('Label Smoothing TODO')
+                loss_fct = LabelSmoothing(self.smoothing_value)
             part_loss = loss_fct(part_logits.view(-1, self.num_classes), labels.view(-1))
-            loss = part_loss
+            contrast_loss = con_loss(part_tokens[:, 0], labels.view(-1))
+            loss = part_loss + contrast_loss
             return loss, part_logits
         else:
             return part_logits
-        # [TODO] 到这里了
-        return part_tokens
+
+    def load_from(self, weights):
+        with jt.no_grad():
+            self.transformer.embeddings.patch_embeddings.weight = np2jt(weights["embedding/kernel"], conv=True)
+            self.transformer.embeddings.patch_embeddings.bias = np2jt(weights["embedding/bias"])
+            self.transformer.embeddings.cls_token = np2jt(weights["cls"])
+            self.transformer.encoder.part_norm.weight = np2jt(weights["Transformer/encoder_norm/scale"])
+            self.transformer.encoder.part_norm.bias = np2jt(weights["Transformer/encoder_norm/bias"])
+
+            posemb = np2jt(weights["Transformer/posembed_input/pos_embedding"])
+            posemb_new = self.transformer.embeddings.position_embeddings
+            if posemb.size() == posemb_new.size():
+                self.transformer.embeddings.position_embeddings = posemb
+            else:
+                print("load_pretrained: resized variant: %s to %s" % (posemb.size(), posemb_new.size()))
+                ntok_new = posemb_new.size(1)
+
+                if self.classifier == "token":
+                    posemb_tok, posemb_grid = posemb[:, :1], posemb[0, 1:]
+                    ntok_new -= 1
+                else:
+                    posemb_tok, posemb_grid = posemb[:, :0], posemb[0]
+                    
+                gs_old = int(np.sqrt(len(posemb_grid)))
+                gs_new = int(np.sqrt(ntok_new))
+                print('load_pretrained: grid-size from %s to %s' % (gs_old, gs_new))
+                posemb_grid = posemb_grid.reshape(gs_old, gs_old, -1)
+
+                zoom = (gs_new / gs_old, gs_new / gs_old, 1)
+                posemb_grid = ndimage.zoom(posemb_grid, zoom, order=1)
+                posemb_grid = posemb_grid.reshape(1, gs_new * gs_new, -1)
+                posemb = np.concatenate([posemb_tok, posemb_grid], axis=1)
+                
+                self.transformer.embeddings.position_embeddings = (np2jt(posemb))
+            for (i, block) in enumerate(self.transformer.encoder.layer):
+                block.load_from(weights, i)
     
 CONFIGS = {
     'debug': configs.get_debug_config(),

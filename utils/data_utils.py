@@ -28,7 +28,7 @@ def get_loader(args):
             transform.ToTensor(),
             transform.ImageNormalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
-        dataset = CUB(root=args.data_root, data_len=64, train_transform=train_transform, test_transform=test_transform)
+        dataset = CUB(root=args.data_root, data_len=None, train_transform=train_transform, test_transform=test_transform)
         trainset = dataset.get_train_dataset()
         testset = dataset.get_test_dataset()
     else:
